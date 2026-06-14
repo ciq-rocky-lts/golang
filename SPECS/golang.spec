@@ -56,7 +56,7 @@
 %endif
 
 # Controls what ever we fail on failed tests
-%ifarch x86_64 %{arm} ppc64le s390x
+%ifarch x86_64 %{arm} ppc64le s390x aarch64
 %global fail_on_tests 1
 %else
 %global fail_on_tests 0
@@ -92,14 +92,17 @@
 %global gohostarch  s390x
 %endif
 
-%global go_api 1.21
-%global go_version 1.21.13
+%global go_api 1.25
+%global go_version 1.25.9
 %global version %{go_version}
-%global pkg_release 4
+%global pkg_release 2
+
+# LLVM compiler-rt version for race detector
+%global llvm_compiler_rt_version 18.1.8
 
 Name:           golang
-Version:        %{version}
-Release:        3%{?dist}
+Version:	%{version}
+Release:        1%{?dist}
 Summary:        The Go Programming Language
 # source tree includes several copies of Mark.Twain-Tom.Sawyer.txt under Public Domain
 License:        BSD and Public Domain
@@ -114,6 +117,7 @@ Source0:        https://github.com/golang/go/archive/refs/tags/go%{version}.tar.
 Source1:	https://github.com/golang-fips/go/archive/refs/tags/go%{version}-%{pkg_release}-openssl-fips.tar.gz
 # make possible to override default traceback level at build time by setting build tag rpm_crashtraceback
 Source2:        fedora.go
+Source3: 	https://github.com/llvm/llvm-project/releases/download/llvmorg-%{llvm_compiler_rt_version}/compiler-rt-%{llvm_compiler_rt_version}.src.tar.xz
 
 # The compiler is written in Go. Needs go(1.4+) compiler for build.
 # Actual Go based bootstrap compiler provided by above source.
@@ -132,32 +136,33 @@ BuildRequires:  openssl-devel
 # for tests
 BuildRequires:  pcre-devel, glibc-static, perl
 
+# Necessary for building llvm address sanitizer for Go race detector
+BuildRequires: libstdc++-devel
+BuildRequires: clang
+
 Provides:       go = %{version}-%{release}
 Requires:       %{name}-bin = %{version}-%{release}
 Requires:       %{name}-src = %{version}-%{release}
+Requires:       %{name}-race = %{version}-%{release}
 Requires:       openssl-devel
 Requires:       diffutils
 
 # Proposed patch by jcajka https://golang.org/cl/86541
 Patch221:       fix_TestScript_list_std.patch
-Patch230:	update-api-openssl3.patch
 
 Patch1939923:   skip_test_rhbz1939923.patch
 
-# Disables libc static linking tests which
-# are incompatible with dlopen in golang-fips
-Patch2: 	disable_static_tests_part1.patch
-Patch3: 	disable_static_tests_part2.patch
 Patch4:		modify_go.env.patch
+Patch6:		skip_TestCrashDumpsAllThreads.patch
+# Related: https://sourceware.org/bugzilla/show_bug.cgi?id=33204
+Patch7:     revert_dwarf5.patch
+Patch8:     skip-TestTerminalSignal-in-container.patch
 
 # Having documentation separate was broken
 Obsoletes:      %{name}-docs < 1.1-4
 
 # RPM can't handle symlink -> dir with subpackages, so merge back
 Obsoletes:      %{name}-data < 1.1.1-4
-
-# We don't build golang-race anymore, rhbz#2230705
-Obsoletes:      golang-race < 1.20.0
 
 # These are the only RHEL/Fedora architectures that we compile this package for
 ExclusiveArch:  %{golang_arches}
@@ -229,16 +234,6 @@ Summary:        Golang shared object libraries
 %{summary}.
 %endif
 
-%if %{race}
-%package        race
-Summary:        Golang std library with -race enabled
-
-Requires:       %{name} = %{version}-%{release}
-
-%description    race
-%{summary}
-%endif
-
 %package -n go-toolset
 Summary:        Package that installs go-toolset
 Requires:       %{name} = %{version}-%{release}
@@ -249,18 +244,25 @@ Requires:       delve
 %description -n go-toolset
 This is the main package for go-toolset.
 
+
+%package race
+Summary:	Race detetector library object files.
+Requires:       %{name} = %{version}-%{release}
+
+%description    race
+Binary library objects for Go's race detector.
+
 %prep
 %setup -q -n go-go%{version}
 
 pushd ..
 tar -xf %{SOURCE1}
 popd
-
 patch_dir="../go-go%{version}-%{pkg_release}-openssl-fips/patches"
 # Add --no-backup-if-mismatch option to avoid creating .orig temp files
 for p in "$patch_dir"/*.patch; do
-       echo "Applying $p"
-      patch -p1 --no-backup-if-mismatch < $p
+	echo "Applying $p"
+	patch --no-backup-if-mismatch -p1 < $p
 done
 
 # Configure crypto tests
@@ -274,6 +276,13 @@ popd
 sed -i '1s/$/ (%{?rhel:Red Hat} %{version}-%{release})/' VERSION
 
 cp %{SOURCE2} ./src/runtime/
+# CIQ 9.2 backport: keep upstream Go's bundled race detector .syso. The 9.x spec
+# deleted these and rebuilt them from LLVM-18 compiler-rt via clang, but 9.2's
+# buildroot ships clang/llvm 15 which can't build LLVM-18 compiler-rt. Upstream
+# ships the same .syso at the exact %files paths, so we keep and ship those.
+
+# Delete the boring binary blob.  We use the system OpenSSL instead.
+rm -rf src/crypto/internal/boring/syso
 
 %build
 set -xe
@@ -281,6 +290,11 @@ set -xe
 uname -a
 cat /proc/cpuinfo
 cat /proc/meminfo
+
+# CIQ 9.2 backport: do NOT rebuild the race detector from LLVM-18 compiler-rt
+# (9.2 ships clang/llvm 15). Upstream Go's bundled .syso are kept from %prep.
+export GOARCH=$(go env GOARCH)
+
 
 # bootstrap compiler GOROOT
 %if !%{golang_bootstrap}
@@ -294,6 +308,7 @@ export GOROOT_FINAL=%{goroot}
 
 export GOHOSTOS=linux
 export GOHOSTARCH=%{gohostarch}
+export GOAMD64=v2
 
 pushd src
 # use our gcc options for this build, but store gcc as default for compiler
@@ -303,6 +318,7 @@ export CC="gcc"
 export CC_FOR_TARGET="gcc"
 export GOOS=linux
 export GOARCH=%{gohostarch}
+export GOAMD64=v2
 
 DEFAULT_GO_LD_FLAGS=""
 %if !%{external_linker}
@@ -358,20 +374,37 @@ shared_list=$cwd/go-shared.list
 misc_list=$cwd/go-misc.list
 docs_list=$cwd/go-docs.list
 tests_list=$cwd/go-tests.list
+
+# Ensure they don't exist
 rm -f $src_list $pkg_list $docs_list $misc_list $tests_list $shared_list
 touch $src_list $pkg_list $docs_list $misc_list $tests_list $shared_list
+
+##################
+# Register files #
+##################
 pushd $RPM_BUILD_ROOT%{goroot}
-    find src/ -type d -a \( ! -name testdata -a ! -ipath '*/testdata/*' \) -printf '%%%dir %{goroot}/%p\n' >> $src_list
-    find src/ ! -type d -a \( ! -ipath '*/testdata/*' -a ! -name '*_test*.go' \) -printf '%{goroot}/%p\n' >> $src_list
 
-    find bin/ pkg/ -type d -a ! -path '*_dynlink/*' -a ! -path '*_race/*' -printf '%%%dir %{goroot}/%p\n' >> $pkg_list
-    find bin/ pkg/ ! -type d -a ! -path '*_dynlink/*' -a ! -path '*_race/*' -printf '%{goroot}/%p\n' >> $pkg_list
+# Src
+find src/ -type d -a \( ! -name testdata -a ! -ipath '*/testdata/*' \) -printf '%%%dir %{goroot}/%p\n' >> $src_list
+find src/ ! -type d -a \( ! -ipath '*/testdata/*' -a ! -name '*_test*.go' \) -printf '%{goroot}/%p\n' >> $src_list
 
-    find doc/ -type d -printf '%%%dir %{goroot}/%p\n' >> $docs_list
-    find doc/ ! -type d -printf '%{goroot}/%p\n' >> $docs_list
+# Bin
+find bin/ pkg/ -type d -a ! -path '*_dynlink/*' -a ! -path '*_race/*' -printf '%%%dir %{goroot}/%p\n' >> $pkg_list
+find bin/ pkg/ ! -type d -a ! -path '*_dynlink/*' -a ! -path '*_race/*' -printf '%{goroot}/%p\n' >> $pkg_list
 
-    find misc/ -type d -printf '%%%dir %{goroot}/%p\n' >> $misc_list
-    find misc/ ! -type d -printf '%{goroot}/%p\n' >> $misc_list
+# Docs
+find doc/ -type d -printf '%%%dir %{goroot}/%p\n' >> $docs_list
+find doc/ ! -type d -printf '%{goroot}/%p\n' >> $docs_list
+
+# Misc
+find misc/ -type d -printf '%%%dir %{goroot}/%p\n' >> $misc_list
+find misc/ ! -type d -printf '%{goroot}/%p\n' >> $misc_list
+
+# Test
+find test/ -type d -printf '%%%dir %{goroot}/%p\n' >> $tests_list
+find test/ ! -type d -printf '%{goroot}/%p\n' >> $tests_list
+find src/ -type d -a \( -name testdata -o -ipath '*/testdata/*' \) -printf '%%%dir %{goroot}/%p\n' >> $tests_list
+find src/ ! -type d -a \( -ipath '*/testdata/*' -o -name '*_test*.go' \) -printf '%{goroot}/%p\n' >> $tests_list
 
 %if %{shared}
     mkdir -p %{buildroot}/%{_libdir}/
@@ -389,14 +422,6 @@ pushd $RPM_BUILD_ROOT%{goroot}
     find pkg/*_dynlink/ -type d -printf '%%%dir %{goroot}/%p\n' >> $shared_list
     find pkg/*_dynlink/ ! -type d -printf '%{goroot}/%p\n' >> $shared_list
 %endif
-
-    find test/ -type d -printf '%%%dir %{goroot}/%p\n' >> $tests_list
-    find test/ ! -type d -printf '%{goroot}/%p\n' >> $tests_list
-    find src/ -type d -a \( -name testdata -o -ipath '*/testdata/*' \) -printf '%%%dir %{goroot}/%p\n' >> $tests_list
-    find src/ ! -type d -a \( -ipath '*/testdata/*' -o -name '*_test*.go' \) -printf '%{goroot}/%p\n' >> $tests_list
-    # this is only the zoneinfo.zip
-    find lib/ -type d -printf '%%%dir %{goroot}/%p\n' >> $tests_list
-    find lib/ ! -type d -printf '%{goroot}/%p\n' >> $tests_list
 popd
 
 # remove the doc Makefile
@@ -440,6 +465,7 @@ go env
 export CC="gcc"
 export CFLAGS="$RPM_OPT_FLAGS"
 export LDFLAGS="$RPM_LD_FLAGS"
+export GOAMD64=v2
 %if !%{external_linker}
 export GO_LDFLAGS="-linkmode internal"
 %else
@@ -466,9 +492,9 @@ export GOLANG_FIPS=1
 export OPENSSL_FORCE_FIPS_MODE=1
 pushd crypto
   # Run all crypto tests but skip TLS, we will run FIPS specific TLS tests later
-  go test -timeout 50m $(go list ./... | grep -v tls) -v
+  go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="TestEd25519Vectors|TestACVP"
   # Check that signature functions have parity between boring and notboring
-  CGO_ENABLED=0 go test -timeout 50m $(go list ./... | grep -v tls) -v
+  CGO_ENABLED=0 go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="TestEd25519Vectors|TestACVP"
 popd
 # Run all FIPS specific TLS tests
 pushd crypto/tls
@@ -513,8 +539,13 @@ cd ..
 # prelink blacklist
 %{_sysconfdir}/prelink.conf.d
 
-
 %files -f go-src.list src
+%ifarch x86_64
+%exclude %{goroot}/src/runtime/race/internal/amd64v1/race_linux.syso
+%exclude %{goroot}/src/runtime/race/internal/amd64v3/race_linux.syso
+%else
+%exclude %{goroot}/src/runtime/race/race_linux_%{gohostarch}.syso
+%endif
 
 %files -f go-docs.list docs
 
@@ -533,43 +564,150 @@ cd ..
 
 %files -n go-toolset
 
+%files race
+%ifarch x86_64
+%{goroot}/src/runtime/race/internal/amd64v1/race_linux.syso
+%{goroot}/src/runtime/race/internal/amd64v3/race_linux.syso
+%else
+%{goroot}/src/runtime/race/race_linux_%{gohostarch}.syso
+%endif
+
 %changelog
-* Tue Sep 17 2024 David Benoit <dbenoit@redhat.com> - 1.21.13-3
-- Related: RHEL-58226
+* Wed Apr 22 2026 dbenoit <dbenoit@redhat.com> - 1.25.9-1
+- Update to Go 1.25.9 (fips-2)
+- Resolves: RHEL-169931
 
-* Mon Sep 16 2024 David Benoit <dbenoit@redhat.com> - 1.21.13-2
-- Rebuild Go with CVE Fixes
-- Remove fix-memleak-setupRSA.patch (exists upstream)
-- Resolves: RHEL-58226
-- Resolves: RHEL-57962
-- Resolves: RHEL-57848
-- Resolves: RHEL-57865
+* Tue Mar 24 2026 dbenoit <dbenoit@redhat.com> - 1.25.8-2
+- Update to Go 1.25.8 (fips-1)
+- Resolves: RHEL-157451
 
-* Mon Aug 19 2024 Archana <aravinda@redhat.com> - 1.21.13-1
-- Rebase to Go1.21.13 to pick the fix for CVE-2024-24791
-- Technically Go1.21.12 contains the fix for the CVE but there was another
-  latest release so rebasing to that
-- Resolves: RHEL-53547
+* Thu Feb 12 2026 dbenoit <dbenoit@redhat.com> - 1.25.7-1
+- Update to Go 1.25.7 (fips-1)
+- Resolves: RHEL-146476
 
-* Wed Jun 12 2024 Archana Ravindar <aravinda@redhat.com> - 1.21.11-1
-- Update to Go 1.21.11 that fixes CVE-2024-24789 and CVE-2024-24790
-- Resolves: RHEL-40275
+* Tue Jan 20 2026 dbenoit <dbenoit@redhat.com> - 1.25.5-2
+- Rebase to rhel-9-main
+- Related: RHEL-139366
 
-* Thu May 23 2024 David Benoit <dbenoit@redhat.com> - 1.21.10-1
-- Update to Go 1.21.10
-- Resolves: RHEL-36988
-- Resolves: RHEL-35630
+* Mon Jan 19 2026 dbenoit <dbenoit@redhat.com> - 1.25.5-1
+- Update to Go 1.25.5 (fips-1)
+- Resolves: RHEL-139366
 
-* Mon Apr 15 2024 David Benoit <dbenoit@redhat.com> - 1.21.9-2
-- Rebuilt for z-stream
-- Related: RHEL-24312
-- Related: RHEL-28940
+* Fri Dec 19 2025 Alejandro Sáez <asm@redhat.com> - 1.25.3-2
+- Cleanup lib/ ownership
 
-* Fri Apr 5 2024 Archana Ravindar <aravinda@redhat.com> - 1.21.9-1
-- Fix CVE-2024-1394
-- Fix CVE-2023-45288
-- Resolves RHEL-24312
-- Resolves RHEL-28940
+* Wed Oct 29 2025 Alejandro Sáez <asm@redhat.com> - 1.25.3-1
+- Update to Go 1.25.3
+- Related: RHEL-139366
+
+* Mon Sep 29 2025 Archana Ravindar <aravinda@redhat.com> - 1.25.1-1
+- Update to Go 1.25.1
+- Related: RHEL-139366
+
+* Fri Sep 12 2025 Alejandro Sáez <asm@redhat.com> - 1.25.0-2
+- Revert DWARF5 defaults
+- Add elf5 to rpminspect.yaml
+- Related: RHEL-139366
+
+* Wed Aug 20 2025 Alejandro Sáez <asm@redhat.com> - 1.25.0-1
+- Update to Go 1.25.0
+- Set GOAMD64 to v2 to align with new architecture baselines
+- Modify the modify_go.env.patch to reflect GOAMD64 baseline version change to v2
+- Resolves: RHEL-109557
+
+* Wed Aug 13 2025 David Benoit <dbenoit@redhat.com> - 1.24.6-1
+- Update to Go 1.24.6 (fips-1)
+- Resolves: RHEL-106461
+
+* Mon Jul 21 2025 David Benoit <dbenoit@redhat.com> - 1.24.4-3
+- Re-enable debguginfo and waive rpminspect result
+- Resolves: RHEL-101454
+
+* Thu Jun 26 2025 Alejandro Sáez <asm@redhat.com> - 1.24.4-2
+- Add LD_FLAGS for stripping binaries
+- Resolves: RHEL-93238
+
+* Fri Jun 13 2025 David Benoit <dbenoit@redhat.com> - 1.24.4-1
+- Update to Go 1.24.4 (fips-1)
+- Resolves: RHEL-95998
+
+* Mon Jun 02 2025 David Benoit <dbenoit@redhat.com> - 1.24.3-3
+- Update to Go 1.24.3 (fips-3)
+- Fix linkage issue in bin/go
+- Fix loading issue in non-fips mode
+- Related: RHEL-83439
+- Related: RHEL-87632
+
+* Thu May 29 2025 David Benoit <dbenoit@redhat.com> - 1.24.3-2
+- Update to Go 1.24.3 (fips-2)
+- Resolves: RHEL-87632
+
+* Thu May 08 2025 David Benoit <dbenoit@redhat.com> - 1.24.3-1
+- Update to Go 1.24.3 (fips-1)
+- Exclude TestEd25519Vectors, TestACVP which require network
+- Resolves: RHEL-83439
+- Resolves: RHEL-85268
+- Resolves: RHEL-87632
+- Resolves: RHEL-91312
+- Resolves: RHEL-92023
+
+* Thu Jan 09 2025 David Benoit <dbenoit@redhat.com> - 1.23.4-1
+- Update to Go 1.23.4 (fips-1)
+- Resolves: RHEL-61048
+- Resolves: RHEL-61223
+
+* Wed Oct 23 2024 Archana <aravinda@redhat.com> - 1.23.2-1
+- Rebase to Go1.23.2
+- Remove fix standard crypto panic patch as the source already has changes
+- Resolves: RHEL-62392
+
+* Wed Aug 14 2024 David Benoit <dbenoit@redhat.com> - 1.22.5-2
+- Rebuild race detector archives from LLVM sources
+- Add golang-race subpackage
+- Resolves: RHEL-33421
+- Remove unused crypto/internal/boring/syso package
+- Resolves: RHEL-54335
+
+* Thu Jul 11 2024 Archana <aravinda@redhat.com> - 1.22.5-1
+- Rebase to Go1.22.5 to address CVE-2024-24791
+- Resolves: RHEL-46973
+
+* Thu Jun 27 2024 David Benoit <dbenoit@redhat.com> - 1.22.4-2
+- Fix panic in standard crypto mode without openssl
+- Resolves: RHEL-45359
+
+* Thu Jun 6 2024 Archana Ravindar <aravinda@redhat.com> - 1.22.4-1
+- Rebase to Go1.22.4 that includes fixes for CVE-2024-24789 and CVE-2024-24790
+- Resolves: RHEL-40156
+
+* Thu May 30 2024 Derek Parker <deparker@redhat.com> - 1.22.3-3
+- Update openssl backend
+- Resolves: RHEL-36101
+
+* Thu May 23 2024 Derek Parker <deparker@redhat.com> - 1.22.3-2
+- Restore HashSign / HashVerify API
+- Resolves: RHEL-35883
+
+* Wed May 22 2024 Alejandro Sáez <asm@redhat.com> - 1.22.3-1
+- Rebase to 1.22.3
+- Removes re-enable-cgo.patch
+- Resolves: RHEL-35634
+- Resolves: RHEL-35883
+- Resolves: RHEL-10068
+- Resolves: RHEL-34924
+
+* Thu Apr 18 2024 Derek Parker <deparker@redhat.com> - 1.22.2-1
+- Rebase to 1.22.2
+- Resolves: RHEL-28941
+
+* Tue Apr 09 2024 Alejandro Sáez <asm@redhat.com> - 1.22.1-2
+- Set the AMD64 baseline to v2
+
+* Tue Mar 19 2024 Alejandro Sáez <asm@redhat.com> - 1.22.1-1
+- Rebase to Go 1.22.1
+- Re-enable CGO
+- Resolves: RHEL-29527
+- Resolves: RHEL-28175
 
 * Fri Feb 09 2024 Alejandro Sáez <asm@redhat.com> - 1.21.7-1
 - Rebase to Go 1.21.7
