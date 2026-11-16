@@ -92,8 +92,22 @@
 %global gohostarch  s390x
 %endif
 
-%global go_api 1.25
-%global go_version 1.25.9
+# Set the RHEL architecture baseline.
+%if 0%{?rhel} < 9
+%global goamd64 v1
+%global goppc64 power8
+%else
+%if 0%{?rhel} < 10
+%global goamd64 v2
+%global goppc64 power8
+%else
+%global goamd64 v3
+%global goppc64 power9
+%endif
+%endif
+
+%global go_api 1.26
+%global go_version 1.26.7
 %global version %{go_version}
 %global pkg_release 2
 
@@ -102,7 +116,7 @@
 
 Name:           golang
 Version:	%{version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        The Go Programming Language
 # source tree includes several copies of Mark.Twain-Tom.Sawyer.txt under Public Domain
 License:        BSD and Public Domain
@@ -275,11 +289,16 @@ popd
 
 sed -i '1s/$/ (%{?rhel:Red Hat} %{version}-%{release})/' VERSION
 
+# Historically the ISA baselines have been set in modify-go.env.patch.
+# This will prevent us sharing a specfile across major RHEL versions.
+# As such, we must override the baselines set in the patch file.
+sed -iE "s/^.*baseline for RHEL.*$//" go.env
+sed -i "s/GOAMD64=.*/GOAMD64=%{goamd64}/" go.env
+sed -i "s/GOPPC64=.*/GOPPC64=%{goppc64}/" go.env
+
 cp %{SOURCE2} ./src/runtime/
-# CIQ 9.2 backport: keep upstream Go's bundled race detector .syso. The 9.x spec
-# deleted these and rebuilt them from LLVM-18 compiler-rt via clang, but 9.2's
-# buildroot ships clang/llvm 15 which can't build LLVM-18 compiler-rt. Upstream
-# ships the same .syso at the exact %files paths, so we keep and ship those.
+# Delete the bundled race detector objects.
+find ./src/runtime/race/ -name "race_*.syso" -exec rm {} \;
 
 # Delete the boring binary blob.  We use the system OpenSSL instead.
 rm -rf src/crypto/internal/boring/syso
@@ -291,9 +310,38 @@ uname -a
 cat /proc/cpuinfo
 cat /proc/meminfo
 
-# CIQ 9.2 backport: do NOT rebuild the race detector from LLVM-18 compiler-rt
-# (9.2 ships clang/llvm 15). Upstream Go's bundled .syso are kept from %prep.
+# Build race detector .syso's from llvm sources
+# The race detector requests a -fno-exceptions build.
+%global tsan_buildflags %(rpm -D 'toolchain clang' -E '%{optflags}' | sed 's/-fexceptions//')
+%global tsan_optflag -O1
+mkdir ../llvm
+
+tar -xf %{SOURCE3} -C ../llvm
+tsan_go_dir="../llvm/compiler-rt-%{llvm_compiler_rt_version}.src/lib/tsan/go"
+
+# The script uses uname -a and grep to set the GOARCH.  This
+# is unreliable and can get the wrong architecture in
+# circumstances like cross-architecture emulation.  We fix it
+# by just reading GOARCH directly from Go.
 export GOARCH=$(go env GOARCH)
+
+%ifarch x86_64
+pushd "${tsan_go_dir}"
+  CFLAGS="%{tsan_buildflags} %{tsan_optflag}" CC=clang GOAMD64=v3 ./buildgo.sh
+popd
+cp "${tsan_go_dir}"/race_linux_amd64.syso ./src/runtime/race/internal/amd64v3/race_linux.syso
+
+pushd "${tsan_go_dir}"
+  CFLAGS="%{tsan_buildflags} %{tsan_optflag}" CC=clang GOAMD64=v1 ./buildgo.sh
+popd
+cp "${tsan_go_dir}"/race_linux_amd64.syso ./src/runtime/race/internal/amd64v1/race_linux.syso
+
+%else
+pushd "${tsan_go_dir}"
+  CFLAGS="%{tsan_buildflags} %{tsan_optflag}" CC=clang ./buildgo.sh
+popd
+cp "${tsan_go_dir}"/race_linux_%{gohostarch}.syso ./src/runtime/race/race_linux_%{gohostarch}.syso
+%endif
 
 
 # bootstrap compiler GOROOT
@@ -308,7 +356,7 @@ export GOROOT_FINAL=%{goroot}
 
 export GOHOSTOS=linux
 export GOHOSTARCH=%{gohostarch}
-export GOAMD64=v2
+export GOAMD64=%{goamd64}
 
 pushd src
 # use our gcc options for this build, but store gcc as default for compiler
@@ -318,7 +366,7 @@ export CC="gcc"
 export CC_FOR_TARGET="gcc"
 export GOOS=linux
 export GOARCH=%{gohostarch}
-export GOAMD64=v2
+export GOAMD64=%{goamd64}
 
 DEFAULT_GO_LD_FLAGS=""
 %if !%{external_linker}
@@ -465,7 +513,7 @@ go env
 export CC="gcc"
 export CFLAGS="$RPM_OPT_FLAGS"
 export LDFLAGS="$RPM_LD_FLAGS"
-export GOAMD64=v2
+export GOAMD64=%{goamd64}
 %if !%{external_linker}
 export GO_LDFLAGS="-linkmode internal"
 %else
@@ -492,9 +540,10 @@ export GOLANG_FIPS=1
 export OPENSSL_FORCE_FIPS_MODE=1
 pushd crypto
   # Run all crypto tests but skip TLS, we will run FIPS specific TLS tests later
-  go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="TestEd25519Vectors|TestACVP"
+  FIPS_SKIP="TestEd25519Vectors|TestACVP|TestGCMNoncesFIPSV126|TestGCMNoncesFIPSV1|TestWithoutEnforcement|TestCASTPasses|TestCASTFailures|TestIntegrityCheck|TestBetterTLS"
+  go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="$FIPS_SKIP"
   # Check that signature functions have parity between boring and notboring
-  CGO_ENABLED=0 go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="TestEd25519Vectors|TestACVP"
+  CGO_ENABLED=0 go test -timeout 50m $(go list ./... | grep -v tls) -v -skip="$FIPS_SKIP"
 popd
 # Run all FIPS specific TLS tests
 pushd crypto/tls
@@ -573,41 +622,46 @@ cd ..
 %endif
 
 %changelog
-* Wed Apr 22 2026 dbenoit <dbenoit@redhat.com> - 1.25.9-1
-- Update to Go 1.25.9 (fips-2)
-- Resolves: RHEL-169931
+* Tue Sep 22 2026 David Benoit <dbenoit> - 1.26.7-2
+- Update to Go 1.26.7 (fips-2)
+- Resolves: RHEL-266348
 
-* Tue Mar 24 2026 dbenoit <dbenoit@redhat.com> - 1.25.8-2
-- Update to Go 1.25.8 (fips-1)
-- Resolves: RHEL-157451
+* Fri Aug 21 2026 Archana <aravinda@redhat.com> - 1.26.7-1
+- Update to Go 1.26.7 (fips-1)
+- Resolves: RHEL-246425
+
+* Tue Aug 11 2026 dbenoit <dbenoit@redhat.com> - 1.26.5-2
+- Update to Go 1.26.5 (fips-2)
+- Limit RAND_bytes concurrency
+- Resolves: RHEL-215845
+
+* Wed Jul 08 2026 dbenoit <dbenoit@redhat.com> - 1.26.5-1
+- Update to Go 1.26.5 (fips-1)
+- Resolves: RHEL-193476
 
 * Thu Feb 12 2026 dbenoit <dbenoit@redhat.com> - 1.25.7-1
 - Update to Go 1.25.7 (fips-1)
-- Resolves: RHEL-146476
-
-* Tue Jan 20 2026 dbenoit <dbenoit@redhat.com> - 1.25.5-2
-- Rebase to rhel-9-main
-- Related: RHEL-139366
+- Resolves: RHEL-146452
 
 * Mon Jan 19 2026 dbenoit <dbenoit@redhat.com> - 1.25.5-1
 - Update to Go 1.25.5 (fips-1)
-- Resolves: RHEL-139366
+- Resolves: RHEL-139364
 
 * Fri Dec 19 2025 Alejandro Sáez <asm@redhat.com> - 1.25.3-2
 - Cleanup lib/ ownership
 
 * Wed Oct 29 2025 Alejandro Sáez <asm@redhat.com> - 1.25.3-1
 - Update to Go 1.25.3
-- Related: RHEL-139366
+- Resolves: RHEL-121220
 
 * Mon Sep 29 2025 Archana Ravindar <aravinda@redhat.com> - 1.25.1-1
 - Update to Go 1.25.1
-- Related: RHEL-139366
+- Resolves: RHEL-116850
 
 * Fri Sep 12 2025 Alejandro Sáez <asm@redhat.com> - 1.25.0-2
 - Revert DWARF5 defaults
 - Add elf5 to rpminspect.yaml
-- Related: RHEL-139366
+- Related: RHEL-109557
 
 * Wed Aug 20 2025 Alejandro Sáez <asm@redhat.com> - 1.25.0-1
 - Update to Go 1.25.0
