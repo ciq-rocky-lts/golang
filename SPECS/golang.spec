@@ -93,16 +93,16 @@
 %endif
 
 %global go_api 1.25
-%global go_version 1.25.9
+%global go_version 1.25.14
 %global version %{go_version}
-%global pkg_release 2
+%global pkg_release 1
 
 # LLVM compiler-rt version for race detector
 %global llvm_compiler_rt_version 18.1.8
 
 Name:           golang
 Version:	%{version}
-Release:        1%{?dist}
+Release:        1.1%{?dist}
 Summary:        The Go Programming Language
 # source tree includes several copies of Mark.Twain-Tom.Sawyer.txt under Public Domain
 License:        BSD and Public Domain
@@ -573,6 +573,15 @@ cd ..
 %endif
 
 %changelog
+* Tue Nov 18 2026 Jason Rodriguez <jrodriguez@ciq.com> - 1.25.14-1.1
+- Update to Go 1.25.14 (fips-1) — patch-line rollforward, remediates the Go
+  stdlib CVE wave affecting the 1.25.9 base:
+  CVE-2026-33818, CVE-2026-56853, CVE-2026-56858, CVE-2026-56859,
+  CVE-2026-56860, CVE-2026-56862 (fixed upstream in 1.25.13) and
+  CVE-2026-42499, CVE-2026-33811 (fixed upstream in 1.25.10);
+  CVE-2026-25679/32280/32281/32283 do not affect 1.25.9
+- Resolves: lts92 Go stdlib CVE wave (Go Toolchain CVE Wave lts92 Review Board)
+
 * Wed Apr 22 2026 dbenoit <dbenoit@redhat.com> - 1.25.9-1
 - Update to Go 1.25.9 (fips-2)
 - Resolves: RHEL-169931
